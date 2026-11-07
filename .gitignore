@@ -1,0 +1,16 @@
+# .NET build výstupy
+bin/
+obj/
+publish/
+*.user
+*.suo
+.vs/
+
+# lokální / dočasné
+UhfTagAnalyzer-portable/
+manual/prev/
+image.png
+
+# OS
+Thumbs.db
+desktop.ini

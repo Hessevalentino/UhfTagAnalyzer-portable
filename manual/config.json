@@ -1,0 +1,16 @@
+{
+  "theme": "technical",
+  "accent": "#06B6D4",
+  "lang": "cs",
+  "cover": true,
+  "toc": true,
+  "title": "UhfTagAnalyzer",
+  "subtitle": "Uživatelská a technická příručka · CF601 UHF RFID",
+  "author": "Hesse Valentino · hesse.works",
+  "date": "2026",
+  "logo": "logo.png",
+  "header_left": "UhfTagAnalyzer",
+  "header_right": "{section}",
+  "footer_left": "Příručka · hesse.works",
+  "footer_right": "{page} / {pages}"
+}
