@@ -29,9 +29,12 @@
 
 **UhfTagAnalyzer** je přenosný program pro Windows, který přes USB čtečku **CF601** pracuje
 s pasivními **UHF RFID tagy** (EPC Gen2 / ISO 18000‑6C). Přiložíš tag a program z něj vytáhne
-**maximum informací** — EPC, výrobce a model čipu, obsah paměti, stav hesel a zámků — a řekne,
-jestli je tag **funkční**. Umí tagy i **zapisovat, zamykat, nastavovat hesla, zničit (kill)** a
-**obnovit zapomenuté přístupové heslo** vlastního tagu.
+**maximum informací** — EPC, výrobce a model čipu, unikátní sériové číslo čipu, obsah paměti,
+stav hesel — a řekne, jestli je tag **funkční**. Umí tagy i **zapisovat, zamykat, nastavovat
+hesla, zničit (kill)** a **obnovit zapomenuté přístupové heslo** vlastního tagu — pouze čtením,
+bez zápisu do tagu.
+
+> ✅ Čtecí a analytická část je **ověřená na reálné čtečce CF601** (FW V1.5.06.05) a tagu Impinj M750.
 
 > 💡 Žádná instalace, žádné závislosti. Rozbalíš, spustíš `.exe`. Vše potřebné je uvnitř.
 
@@ -55,15 +58,16 @@ Program je rozdělený do záložek:
 
 | Záložka | Co dělá |
 |---|---|
-| 🔍 **Analýza** | kompletní rozbor jednoho tagu: detekce, RSSI, PC slovo, **identifikace čipu z TID** (výrobce + model), kontrola CRC, výklad EPC, hesla, USER paměť, **barevný verdikt** funkčnosti |
+| 🔍 **Analýza** | kompletní rozbor jednoho tagu (~2 s): detekce, PC slovo, **identifikace čipu z TID** (výrobce + model + sériové číslo čipu), kontrola CRC, výklad EPC (SGTIN/SSCC/GID…), hesla, USER paměť, **barevný verdikt** funkčnosti |
 | 📡 **Sken / CSV** | průběžné skenování více tagů naráz, živý seznam, **export do CSV** |
-| 🧠 **Paměť** | kompletní **dump všech 4 bank** (RESERVED / EPC / TID / USER) jako tabulka slov, odvození zámků |
-| 🧪 **Testy** | **test citlivosti** (min. výkon pro čtení), **kanálový sken**, **soak test** stability (A–F), teplota čtečky |
-| ⚙️ **Konfigurace** | region (EU…), výkon, Q, session, WorkMode, reboot čtečky |
+| 🧠 **Paměť** | kompletní **dump všech 4 bank** (RESERVED / EPC / TID / USER) až do jejich konce, jako tabulka slov s výkladem |
+| 🧪 **Testy** | **test citlivosti** (min. výkon pro čtení), **soak test** stability (A–F), teplota čtečky |
+| ⚙️ **Konfigurace** | **region** (EU/ETSI…) vč. frekvenční tabulky, výkon, Q, session, WorkMode, výstupní port |
 | 🛠️ **Operace** | **zápis EPC/USER**, nastavení hesel, **lock/unlock/permalock**, **kill**, a **obnova zapomenutého hesla** (slovník + maska + vlastní soubor) |
 
-**Identifikace čipů:** Impinj (Monza R6, M7xx…), NXP (UCODE 7/8/9, G2iL…), Alien (Higgs‑3/4/9),
-EM Microelectronic, STMicro a další — podle MDID/TMN v TID bance, vždy i se surovým TID.
+**Identifikace čipů** — modely jen z datasheetů výrobců, výrobci dle registru GS1:
+Impinj (Monza 4D/4QT/4E, Monza R6, R6‑P, M730, M750, M770), NXP (UCODE 7, 8, 8m, 9, 9xm, 9xe),
+Alien (Higgs‑3, Higgs‑4). Neznámý model program ohlásí jako „není v tabulce" — vždy i se surovým TID.
 
 ## 🖼️ Screenshoty
 
@@ -115,19 +119,33 @@ dotnet publish -c Release -r win-x86 --self-contained true -o publish
 
 Nebo prostě spusť `build.cmd`. Výsledek je v `publish/`.
 
+### Diagnostika bez GUI
+
+```bash
+UhfTagAnalyzer.exe --selftest-decode   # testy dekodérů (CRC, TID/XTID, EPC, hesla, regiony) – bez čtečky
+UhfTagAnalyzer.exe --selftest          # připojení + analýza + dump – jen čtení, do tagu nic nezapisuje
+```
+
+Výsledek se uloží do `selftest-decode.log` / `selftest.log` vedle exe. Plán testů a záznam výsledků
+je v [TESTPLAN.md](TESTPLAN.md).
+
 ## 🧩 Jak to funguje
 
 - Čtečka **CF601 se připojuje přes USB‑HID**, ne jako COM port — proto se **nevybírá žádný
   port ani baud rate**. Program zavolá `CFHid_GetUsbCount()` a otevře první čtečku
   (`OpenHidConnection`).
-- Komunikace probíhá přes nativní knihovnu `UHFPrimeReader.dll` (P/Invoke).
-- **Identifikace čipu** se počítá z TID banky (pole MDID = výrobce, TMN = model dle EPC Tag
-  Data Standard).
-- **Obnova hesla** funguje jako nedestruktivní *orákulum*: na zamčeném tagu zkouší zapsat zpět
-  stejná data různými hesly; projde jen to správné.
+- Z výroby je CF601 v **režimu klávesnice** (sama čte a „píše" EPC do oken). Program ji při
+  připojení přepne do odpovědního režimu přes USB, a když nevysílá v pásmu EU, nabídne přepnutí
+  regionu.
+- Komunikace probíhá přes nativní knihovnu `UHFPrimeReader.dll` (P/Invoke). Každá operace se
+  vyhodnocuje podle **odpovědi tagu**, ne podle přijetí příkazu čtečkou.
+- **Identifikace čipu** se počítá z TID banky (MDID = výrobce, TMN = model, XTID = sériové číslo).
+- **Obnova hesla** funguje jako nedestruktivní *orákulum* **čtením**: čtečka při nenulovém hesle
+  posílá Gen2 *Access* — se špatným heslem čtení TID selže, se správným projde. Do tagu se nic
+  nezapisuje; nalezené heslo se potvrdí přečtením banky RESERVED.
 
-Podrobnosti v [manuálu (PDF)](manual/UhfTagAnalyzer-manual.pdf) — 19 stran včetně teorie
-EPC Gen2, paměťových bank, hesel a zámků.
+Podrobnosti v [manuálu (PDF)](manual/UhfTagAnalyzer-manual.pdf) — 21 stran včetně teorie
+EPC Gen2, paměťových bank, hesel a zámků a řešení problémů.
 
 ## 📁 Struktura projektu
 

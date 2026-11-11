@@ -109,6 +109,11 @@ namespace UhfTagAnalyzer
         public static extern int WriteTag(IntPtr hComm, byte option, byte[] accPwd,
                                           byte memBank, ushort wordPtr, byte wordCount, byte[] writeData);
 
+        // Odpoved tagu na zapis/lock/kill. cmd: 0x0004 = WRITE, 0x0005 = LOCK, 0x0006 = KILL (CFApi.h ISO_*).
+        // Volat ve smycce az do -249 (konec operace) – stejne jako GetReadTagResp.
+        [DllImport(DLL)]
+        public static extern int GetTagResp(IntPtr hComm, ushort cmd, out TagResp resp, ushort timeout);
+
         [DllImport(DLL)]
         public static extern int LockTag(IntPtr hComm, byte[] accPwd, byte erea, byte action);
 
@@ -147,13 +152,19 @@ namespace UhfTagAnalyzer
             { -255, "Chybny handle nebo parametr" },
             { -254, "Nepodarilo se otevrit ctecku" },
             { -253, "Interni chyba knihovny" },
-            { -249, "Inventura nenasla tag / skoncila" },
+            { -252, "Chybny parametr prikazu" },
+            { -251, "Seriove cislo uz existuje" },
+            { -250, "Interni chyba prikazu ctecky" },
+            { -249, "Tag nenalezen / operace skoncila" },
             { -248, "Tag neodpovedel (timeout odpovedi tagu)" },
             { -247, "Chyba demodulace dat tagu" },
             { -246, "Data tagu presahla max. delku prenosu" },
             { -245, "Autentizace selhala" },
             { -244, "Chybne heslo" },
+            { -243, "SAM neodpovida" },
+            { -242, "Prikaz SAM selhal" },
             { -241, "Chybny format odpovedi ctecky" },
+            { -240, "Ctecka ma dalsi data" },
             { -239, "Prichozi cache je prilis mala, data pretekla" },
             { -238, "Timeout cekani na odpoved ctecky" },
             { -237, "Chyba zapisu do ctecky" },

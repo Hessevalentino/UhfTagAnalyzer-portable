@@ -8,6 +8,11 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <AssemblyName>UhfTagAnalyzer</AssemblyName>
+    <Version>1.1.0</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <Product>UhfTagAnalyzer</Product>
+    <Authors>Hesse Valentino</Authors>
+    <Copyright>© 2026 Hesse Valentino (hesse.works)</Copyright>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>app.ico</ApplicationIcon>
 

@@ -28,7 +28,8 @@ namespace UhfTagAnalyzer
 
         public MainForm()
         {
-            Text = "CF601 UHF Tag Analyzer";
+            var ver = GetType().Assembly.GetName().Version;
+            Text = "CF601 UHF Tag Analyzer  v" + (ver != null ? ver.ToString(3) : "?");
             Width = 1140; Height = 800;
             MinimumSize = new Size(980, 660);
             StartPosition = FormStartPosition.CenterScreen;
@@ -50,7 +51,7 @@ namespace UhfTagAnalyzer
             var top = new Panel { Dock = DockStyle.Top, Height = 54, Padding = new Padding(12, 9, 10, 9), BackColor = Theme.Bg };
             var topFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, BackColor = Theme.Bg, WrapContents = false };
             _led = new StatusLed { Margin = new Padding(0, 2, 6, 2) };
-            _btnConnect = new SoftButton(SoftButton.Kind.Success) { Text = "Pripojit" }; ((SoftButton)_btnConnect).FitWidth(); _btnConnect.Click += (s, e) => Connect();
+            _btnConnect = new SoftButton(SoftButton.Kind.Success) { Text = "Pripojit" }; ((SoftButton)_btnConnect).FitWidth(); _btnConnect.Click += async (s, e) => await Connect();
             _btnDisconnect = new SoftButton(SoftButton.Kind.Danger) { Text = "Odpojit" }; ((SoftButton)_btnDisconnect).FitWidth(); _btnDisconnect.Click += (s, e) => Disconnect();
             topFlow.Controls.AddRange(new Control[] { _led, _btnConnect, _btnDisconnect });
             top.Controls.Add(topFlow);
@@ -127,7 +128,7 @@ namespace UhfTagAnalyzer
         {
             var tp = new TabPage("Analyza");
             var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(6, 8, 6, 6) };
-            var bAnalyze = Btn("Analyzuj tag", (s, e) => Analyze(), primary: true);
+            var bAnalyze = Btn("Analyzuj tag", async (s, e) => await Analyze(), primary: true);
             var bSave = Btn("Ulozit report", (s, e) => SaveReport());
             var lbl = new Label { Text = "Inventura (s):", AutoSize = true, Padding = new Padding(10, 7, 2, 0) };
             _scanDur = new NumericUpDown { Minimum = 0.3M, Maximum = 10M, Increment = 0.5M, DecimalPlaces = 1, Value = 1.0M, Width = 60 };
@@ -138,7 +139,15 @@ namespace UhfTagAnalyzer
             _tagList.SelectedIndexChanged += (s, e) => { if (_tagList.SelectedItems.Count > 0 && _tagList.SelectedItems[0].Tag is AnalysisResult r) { _detail.Text = r.Report; Colorize(r); } };
             _detail = OutBox();
 
-            var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 300 };
+            // Levy seznam tagu pevne ~420 px, report dostane zbytek sirky. SplitterDistance se musi
+            // nastavit az po rozvrzeni (pri vytvoreni ma SplitContainer vychozi sirku a hodnota se orizne).
+            var split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1 };
+            bool splitSet = false;
+            split.SizeChanged += (s, e) =>
+            {
+                if (splitSet || split.Width < 700) return;
+                try { split.SplitterDistance = 420; splitSet = true; } catch { }
+            };
             split.Panel1.Controls.Add(Group("Detekovane tagy", _tagList));
             split.Panel2.Controls.Add(Group("Analyza", _detail));
 
@@ -156,7 +165,7 @@ namespace UhfTagAnalyzer
             return card;
         }
 
-        async void Analyze()
+        async Task Analyze()
         {
             if (!Ready()) return;
             _tagList.Items.Clear(); _detail.Clear();
@@ -213,8 +222,9 @@ namespace UhfTagAnalyzer
             bar.Controls.AddRange(new Control[] { _bScanStart, _bScanStop, bClear, bCsv });
 
             _scanList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true };
+            // sloupec "Kanal" vynechan – CF601 hlasi v inventure vzdy kanal 0
             _scanList.Columns.Add("EPC", 300); _scanList.Columns.Add("Cteni", 60); _scanList.Columns.Add("RSSI", 60);
-            _scanList.Columns.Add("Ant", 40); _scanList.Columns.Add("Kanal", 50); _scanList.Columns.Add("Naposledy", 90);
+            _scanList.Columns.Add("Ant", 40); _scanList.Columns.Add("Naposledy", 90);
 
             tp.Controls.Add(Group("Nasbirane tagy (prubezny sken)", _scanList)); tp.Controls.Add(bar);
             return tp;
@@ -224,6 +234,7 @@ namespace UhfTagAnalyzer
         {
             if (!Ready()) return;
             _bScanStart.Enabled = false; _bScanStop.Enabled = true;
+            try { _reader.ClearSelect(); } catch { }
             Log("Prubezny sken spusten.");
             _scanTimer = new System.Windows.Forms.Timer { Interval = 300 };
             _scanTimer.Tick += (s, e) => ScanTick();
@@ -257,7 +268,7 @@ namespace UhfTagAnalyzer
         void UpsertScanRow(string epc, TagRecord r)
         {
             var existing = _scanList.Items.Cast<ListViewItem>().FirstOrDefault(i => i.Text == epc);
-            string[] vals = { epc, r.Count.ToString(), r.Rssi.ToString("0.0"), r.Antenna.ToString(), r.Channel.ToString(), DateTime.Now.ToString("HH:mm:ss") };
+            string[] vals = { epc, r.Count.ToString(), r.Rssi.ToString("0.0"), r.Antenna.ToString(), DateTime.Now.ToString("HH:mm:ss") };
             if (existing != null) { for (int i = 0; i < vals.Length; i++) existing.SubItems[i].Text = vals[i]; }
             else _scanList.Items.Add(new ListViewItem(vals));
         }
@@ -274,8 +285,8 @@ namespace UhfTagAnalyzer
             if (_scanTags.Count == 0) { Log("Nic k exportu."); return; }
             using var dlg = new SaveFileDialog { Filter = "CSV (*.csv)|*.csv", FileName = "tag-scan-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv" };
             if (dlg.ShowDialog(this) != DialogResult.OK) return;
-            var sb = new StringBuilder("EPC;Cteni;RSSI_dBm;Antena;Kanal\r\n");
-            foreach (var kv in _scanTags) sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "{0};{1};{2:0.0};{3};{4}", kv.Key, kv.Value.Count, kv.Value.Rssi, kv.Value.Antenna, kv.Value.Channel));
+            var sb = new StringBuilder("EPC;Cteni;RSSI_dBm;Antena\r\n");
+            foreach (var kv in _scanTags) sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "{0};{1};{2:0.0};{3}", kv.Key, kv.Value.Count, kv.Value.Rssi, kv.Value.Antenna));
             File.WriteAllText(dlg.FileName, sb.ToString());
             Log("CSV ulozeno: " + dlg.FileName);
         }
@@ -286,7 +297,7 @@ namespace UhfTagAnalyzer
         {
             var tp = new TabPage("Pamet");
             var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(6, 8, 6, 6) };
-            var bDump = Btn("Dump vsech bank", (s, e) => DumpMemory());
+            var bDump = Btn("Dump vsech bank", async (s, e) => await DumpMemory());
             var lbl = new Label { Text = "Access heslo (hex):", AutoSize = true, Padding = new Padding(10, 7, 2, 0) };
             _memPwd = new TextBox { Width = 90, Text = "00000000" };
             bar.Controls.AddRange(new Control[] { bDump, lbl, _memPwd });
@@ -295,7 +306,7 @@ namespace UhfTagAnalyzer
             return tp;
         }
 
-        async void DumpMemory()
+        async Task DumpMemory()
         {
             if (!Ready()) return;
             var pwd = ParseHex(_memPwd.Text, 4); if (pwd == null) { Log("Neplatne heslo (4 B hex)."); return; }
@@ -316,7 +327,15 @@ namespace UhfTagAnalyzer
                         }
                         sb.AppendLine(); sb.AppendLine("  ASCII: " + TagDecode.AsciiPreview(d.Data));
                         if (d.Bank == Bank.Tid) { var t = TagDecode.DecodeTid(d.Data); sb.AppendLine("  >> " + t.Summary); if (t.Xtid) sb.AppendLine("  " + (TagDecode.ParseXtid(d.Data) ?? "")); }
-                        if (d.Bank == Bank.Epc && d.Data.Length > 4) { var epc = d.Data.Skip(4).ToArray(); sb.AppendLine("  Vyklad: " + TagDecode.InterpretEpc(epc).Replace("\n", "\n  ")); }
+                        if (d.Bank == Bank.Epc && d.Data.Length > 4)
+                        {
+                            // slovo 0 = CRC, slovo 1 = PC (horni 5 bitu = delka EPC ve slovech)
+                            int pcw = (d.Data[2] << 8) | d.Data[3];
+                            int epcBytes = Math.Min(((pcw >> 11) & 0x1F) * 2, d.Data.Length - 4);
+                            var epc = d.Data.Skip(4).Take(epcBytes).ToArray();
+                            sb.AppendLine(string.Format("  CRC {0:X2}{1:X2}  PC {2:X4}  EPC {3} slov", d.Data[0], d.Data[1], pcw, epcBytes / 2));
+                            if (epc.Length > 0) sb.AppendLine("  Vyklad: " + TagDecode.InterpretEpc(epc).Replace("\n", "\n  "));
+                        }
                     }
                     else sb.AppendLine("  nelze precist: " + (d.Note ?? "?") + "  (banka zamcena / chybi / slaby signal)");
                     sb.AppendLine();
@@ -331,12 +350,13 @@ namespace UhfTagAnalyzer
         {
             var tp = new TabPage("Testy");
             var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 72, Padding = new Padding(4), FlowDirection = FlowDirection.LeftToRight, WrapContents = true };
+            // Pozn.: kanalovy sken odstranen – CF601 hlasi v inventure vzdy kanal 0 (nic by nemeril).
             var bSens = Btn("Test citlivosti", (s, e) => TestSensitivity());
-            var bChan = Btn("Kanalovy sken", (s, e) => TestChannels());
-            var bSoak = Btn("Soak test", (s, e) => TestSoak());
-            var bTemp = Btn("Teplota ctecky", (s, e) => TestTemp());
-            _powMin = Spin("Pmin", 0, 33, 5); _powMax = Spin("Pmax", 0, 33, 20); _soakDur = Spin("Soak s", 1, 120, 10);
-            bar.Controls.AddRange(new Control[] { bSens, bChan, bSoak, bTemp,
+            var bSoak = Btn("Soak test", async (s, e) => await TestSoak());
+            var bTemp = Btn("Teplota ctecky", async (s, e) => await TestTemp());
+            var bStop = Btn("Zastavit", (s, e) => _recCancel = true, danger: true);
+            _powMin = Spin("Pmin", 0, 33, 0); _powMax = Spin("Pmax", 0, 33, 17); _soakDur = Spin("Soak s", 1, 120, 10);
+            bar.Controls.AddRange(new Control[] { bSens, bSoak, bTemp, bStop,
                 Lab("Pmin:"), _powMin, Lab("Pmax:"), _powMax, Lab("Soak s:"), _soakDur });
             _testOut = OutBox();
             tp.Controls.Add(Group("Vysledky testu", _testOut)); tp.Controls.Add(bar);
@@ -353,41 +373,32 @@ namespace UhfTagAnalyzer
             await RunBusy("Test citlivosti", async () =>
             {
                 AppendTest("=== TEST CITLIVOSTI (ramp vykonu) ===");
-                var data = await Task.Run(() => _reader.SensitivityTest(_currentEpc, pmin, pmax, 0.4, s => AppendTest(s)));
-                var first = data.FirstOrDefault(d => d.readRate > 0);
-                if (first.power != 0 || first.readRate > 0) AppendTest(string.Format("\n>> Minimalni vykon pro cteni: {0} dBm", first.power));
+                _recCancel = false;
+                var data = await Task.Run(() => _reader.SensitivityTest(_currentEpc, pmin, pmax, 0.4, s => AppendTest(s), () => _recCancel));
+                var ok = data.Where(d => d.readRate > 0).OrderBy(d => d.power).ToList();
+                if (ok.Count > 0) AppendTest(string.Format("\n>> Minimalni vykon pro cteni: {0} dBm", ok[0].power));
                 else AppendTest("\n>> Tag se nepodarilo precist v zadnem vykonu.");
             });
         }
 
-        async void TestChannels()
-        {
-            if (!Ready()) return;
-            await RunBusy("Kanalovy sken", async () =>
-            {
-                AppendTest("=== KANALOVY SKEN (2 s) ===");
-                var stats = await Task.Run(() => _reader.ChannelScan(2.0, s => AppendTest(s)));
-                foreach (var c in stats) AppendTest(string.Format("  kanal {0,2}: {1,4} cteni   avg RSSI {2:0.0} dBm", c.Channel, c.Count, c.AvgRssi));
-                if (stats.Count == 0) AppendTest("  zadna data (tag v poli?)");
-            });
-        }
-
-        async void TestSoak()
+        async Task TestSoak()
         {
             if (!Ready()) return;
             double sec = (double)_soakDur.Value;
             await RunBusy("Soak test", async () =>
             {
                 AppendTest(string.Format("=== SOAK TEST ({0} s) ===", sec));
-                var st = await Task.Run(() => _reader.SoakTest(sec, s => AppendTest(s)));
-                AppendTest(string.Format("  Cteni/s      : {0:0.0}", st.ReadsPerSec));
+                _recCancel = false;
+                var st = await Task.Run(() => _reader.SoakTest(sec, s => AppendTest(s), () => _recCancel));
+                AppendTest(string.Format("  Uspesnost    : {0:0} % odezev ({1}/{2})", st.SuccessPct, st.TotalReads, st.Polls));
+                AppendTest(string.Format("  Cteni/s      : {0:0.0}   (CF601 max. cca 22/s)", st.ReadsPerSec));
                 AppendTest(string.Format("  Celkem cteni : {0}   Unikatnich tagu: {1}", st.TotalReads, st.UniqueTags));
                 AppendTest(string.Format("  RSSI min/avg/max: {0:0.0} / {1:0.0} / {2:0.0} dBm   odchylka {3:0.0}", st.RssiMin, st.RssiAvg, st.RssiMax, st.RssiStd));
                 AppendTest("  >> Znamka stability: " + st.Grade);
             });
         }
 
-        async void TestTemp()
+        async Task TestTemp()
         {
             if (!Ready()) return;
             await RunBusy("Teplota", async () =>
@@ -405,20 +416,21 @@ namespace UhfTagAnalyzer
         {
             var tp = new TabPage("Konfigurace");
             var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 76, Padding = new Padding(4), WrapContents = true };
-            var bGet = Btn("Nacti konfiguraci", (s, e) => CfgGet());
+            var bGet = Btn("Nacti konfiguraci", async (s, e) => await CfgGet());
             var bSet = Btn("Uloz do ctecky", (s, e) => CfgSet());
-            var bReboot = Btn("Reboot ctecky", (s, e) => CfgReboot());
-            _cfgRegion = new ComboBox { Width = 150, DropDownStyle = ComboBoxStyle.DropDownList };
-            _cfgRegion.Items.AddRange(new object[] { "1 CN 840-845", "2 CN 920-925", "3 EU 865-868", "4 US 902-928", "6 Korea", "7 Japonsko" });
+            // Pozn.: tlacitko Reboot odstraneno – RebootDevice na CF601 vratil region na USA a WorkMode
+            // na aktivni a zaseknuti inventury nevyresil (pomaha jen odpojit/zapojit USB).
+            _cfgRegion = new ComboBox { Width = 270, DropDownStyle = ComboBoxStyle.DropDownList };
+            _cfgRegion.Items.AddRange(TagDecode.RegionTable);   // RegionInfo – kod + frekvencni plan dle vyrobce
             _cfgPower = Spin("", 0, 33, 17); _cfgQ = Spin("", 0, 15, 4); _cfgSession = Spin("", 0, 3, 0); _cfgWorkmode = Spin("", 0, 3, 0);
-            bar.Controls.AddRange(new Control[] { bGet, bSet, bReboot, Lab("Region:"), _cfgRegion,
+            bar.Controls.AddRange(new Control[] { bGet, bSet, Lab("Region:"), _cfgRegion,
                 Lab("Vykon:"), _cfgPower, Lab("Q:"), _cfgQ, Lab("Session:"), _cfgSession, Lab("WorkMode:"), _cfgWorkmode });
             _cfgOut = OutBox();
             tp.Controls.Add(Group("Parametry ctecky (snapshot)", _cfgOut)); tp.Controls.Add(bar);
             return tp;
         }
 
-        async void CfgGet()
+        async Task CfgGet()
         {
             if (!Ready()) return;
             await RunBusy("Nacist konfiguraci", async () =>
@@ -429,43 +441,54 @@ namespace UhfTagAnalyzer
                 sb.AppendLine("Firmware : " + c.Firmware);
                 sb.AppendLine("Hardware : " + c.Hardware);
                 sb.AppendLine("SN       : " + c.Sn);
-                sb.AppendLine(string.Format("Region   : {0} ({1})", c.Region, TagDecode.RegionName(c.Region)));
+                sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "Region   : {0} = {1}", c.Region, TagDecode.RegionName(c.Region)));
+                sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "Frekvence: {0:0.000} – {1:0.000} MHz, {2} kanalu po {3} kHz",
+                    c.FreqStartMHz, c.FreqEndMHz, c.FreqChannels, c.FreqStepKHz));
+                if (!TagDecode.IsEuRegion(c.Region))
+                    sb.AppendLine("  POZOR: v EU/CR je pro UHF RFID povolene jen pasmo 865–868 MHz (zvol region EU).");
                 sb.AppendLine("Vykon    : " + c.Power + " dBm");
-                sb.AppendLine("Q / Session / WorkMode : " + c.QValue + " / " + c.Session + " / " + c.Workmode);
+                sb.AppendLine("Q / Session / WorkMode : " + c.QValue + " / " + c.Session + " / " + c.Workmode + (c.Workmode == 0 ? " (answer)" : c.Workmode == 1 ? " (active)" : " (trigger)"));
+                string portName = c.Port == 1 ? "USB" : c.Port == 2 ? "KLAVESNICE(!)" : c.Port == 4 ? "CDC_COM" : ("? (" + c.Port + ")");
+                sb.AppendLine("Vystupni port : " + portName + (c.Port == 1 ? "  – OK pro API" : "  – pro praci v aplikaci ma byt USB"));
                 sb.AppendLine("Antena   : " + c.Antenna);
                 sb.AppendLine("Protokol : " + (c.RfidType == 0 ? "ISO 18000-6C (Gen2)" : "typ " + c.RfidType));
                 sb.AppendLine("Teplota  : " + c.TempCur + " C (prah " + c.TempLimit + " C)");
-                sb.AppendLine("Start freq (raw): " + c.FreqStart + "   step: " + c.FreqStep);
                 BeginInvoke((Action)(() =>
                 {
                     _cfgOut.Text = sb.ToString();
                     _cfgPower.Value = Clamp(c.Power, 0, 33); _cfgQ.Value = Clamp(c.QValue, 0, 15);
                     _cfgSession.Value = Clamp(c.Session, 0, 3); _cfgWorkmode.Value = Clamp(c.Workmode, 0, 3);
-                    _cfgRegion.SelectedIndex = c.Region switch { 1 => 0, 2 => 1, 3 => 2, 4 => 3, 6 => 4, 7 => 5, _ => -1 };
+                    _cfgRegion.SelectedIndex = Array.FindIndex(TagDecode.RegionTable, r => r.Code == c.Region);
+                    _cfgLoadedRegion = c.Region;
                 }));
             });
         }
 
         decimal Clamp(int v, int lo, int hi) => Math.Max(lo, Math.Min(hi, v));
 
+        int _cfgLoadedRegion = -1;   // region nacteny z ctecky (meni se jen pri skutecne zmene)
+
         async void CfgSet()
         {
             if (!Ready()) return;
-            if (_cfgRegion.SelectedIndex < 0) { Log("Vyber region."); return; }
-            int region = new[] { 1, 2, 3, 4, 6, 7 }[_cfgRegion.SelectedIndex];
+            if (_cfgLoadedRegion < 0) { Log("Nejdriv klikni 'Nacti konfiguraci'."); return; }
+            if (!(_cfgRegion.SelectedItem is RegionInfo ri)) { Log("Vyber region."); return; }
             int pow = (int)_cfgPower.Value, q = (int)_cfgQ.Value, ses = (int)_cfgSession.Value, wm = (int)_cfgWorkmode.Value;
+            if (wm != 0 && MessageBox.Show(this, "WorkMode " + wm + " prepne ctecku do autonomniho rezimu – aplikace pak nebude umet cist tagy (pri pristim pripojeni se vrati na 0).\nPokracovat?",
+                    "WorkMode", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
             await RunBusy("Ulozit konfiguraci", async () =>
             {
-                var r = await Task.Run(() => _reader.SetBasicConfig(region, pow, q, ses, wm));
+                if (ri.Code != _cfgLoadedRegion)
+                {
+                    var rr = await Task.Run(() => _reader.SetRegion(ri.Code));
+                    UiLog(rr.Message);
+                    if (!rr.Ok) return;
+                    _cfgLoadedRegion = ri.Code;
+                }
+                var r = await Task.Run(() => _reader.SetBasicConfig(pow, q, ses, wm));
                 UiLog(r.Message);
             });
-        }
-
-        async void CfgReboot()
-        {
-            if (!Ready()) return;
-            if (MessageBox.Show(this, "Opravdu rebootovat ctecku?", "Reboot", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            await RunBusy("Reboot", async () => { var r = await Task.Run(() => _reader.Reboot()); UiLog(r.Message); });
+            await CfgGet();
         }
 
         // ============================ TAB: OPERACE ============================
@@ -508,7 +531,7 @@ namespace UhfTagAnalyzer
             _opMask = Input(110, "XXXXXXXX");
             _lblDict = new Label { Text = "slovnik nenacten", AutoSize = true, ForeColor = Theme.Muted, Padding = new Padding(6, 6, 0, 0) };
             AddCard(OpCard("Obnova zapomenuteho access hesla",
-                Hint("Zkusi tvoje kandidaty + nahrany slovnik + chytry slovnik (default hesla, odvozena z EPC/TID). Funguje jen na zamcenem tagu, nedestruktivne."),
+                Hint("Zkusi tvoje kandidaty + nahrany slovnik + chytry slovnik (default hesla, odvozena z EPC/TID). Overuje heslo CTENIM – do tagu nic nezapisuje. Funguje na tagu s nastavenym access heslem; tag musi lezet na ctecce."),
                 Row(Lab("Vlastni kandidati (hex, carkami):"), _opRecoveryList),
                 Row(Btn("Nahrat slovnik ze souboru...", (s, e) => OpLoadDict()), _lblDict),
                 Row(Lab("Maska (8 hex, X = nezname):"), _opMask, Btn("Generovat a zkusit", (s, e) => OpRecoverMask())),
@@ -564,7 +587,20 @@ namespace UhfTagAnalyzer
             if (epc == null || epc.Length == 0 || epc.Length % 2 != 0) { OpLog("Neplatne EPC (hex, celá slova)."); return; }
             if (pwd == null) { OpLog("Neplatne access heslo."); return; }
             if (MessageBox.Show(this, "Prepsat EPC na " + TagDecode.Hex(epc, false) + "?", "Zapis EPC", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-            await RunBusy("Zapis EPC", async () => { if (_currentEpc != null) _reader.SelectByEpc(_currentEpc); var r = await Task.Run(() => _reader.WriteEpc(epc, pwd)); OpLog(r.Message); });
+            var cur = _currentEpc;
+            await RunBusy("Zapis EPC", async () =>
+            {
+                if (cur != null) _reader.SelectByEpc(cur);
+                var r = await Task.Run(() => _reader.WriteEpc(epc, pwd, cur));
+                OpLog(r.Message);
+                if (r.Ok)
+                {
+                    // tag ma nove EPC – dalsi operace musi vybirat podle nej
+                    _currentEpc = epc;
+                    _lblTag.Text = "Tag: " + TagDecode.Hex(epc, false);
+                    OpLog("Vybrany tag aktualizovan na nove EPC. Doporuceni: over zapis novou Analyzou.");
+                }
+            });
         }
 
         async void OpWriteUser()
@@ -584,6 +620,10 @@ namespace UhfTagAnalyzer
             if (np == null) { OpLog("Nove heslo musi byt 4 B hex."); return; }
             if (pwd == null) { OpLog("Neplatne access heslo."); return; }
             bool kill = _opPwdWhich.SelectedIndex == 1;
+            // u nekterych cipu (Impinj M700) je kill a access heslo jedno sdilene – uzivatel to musi vedet predem
+            string note = _last?.Tid?.ModelNote;
+            if (note != null && MessageBox.Show(this, "Cip " + _last.Tid.Summary + ":\n" + note + "\n\nPokracovat?",
+                    "Nastavit heslo", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return;
             await RunBusy("Nastavit heslo", async () => { if (_currentEpc != null) _reader.SelectByEpc(_currentEpc); var r = await Task.Run(() => _reader.SetPassword(kill, np, pwd)); OpLog(r.Message); });
         }
 
@@ -664,27 +704,62 @@ namespace UhfTagAnalyzer
         void OpLog(string s) { if (IsHandleCreated) BeginInvoke((Action)(() => _opOut.AppendText(s + "\r\n"))); Log(s); }
 
         // ============================ SPOLECNE ============================
-        void Connect()
+        async Task Connect()
         {
+            if (_busy) return;
+            _busy = true;
+            _btnConnect.Enabled = false;
+            CF601Reader reader = null;
             try
             {
+                // CFHid_GetUsbCount MUSI predchazet OpenHidConnection (jinak DLL spadne na AV).
                 int n = CF601Reader.UsbCount();
                 Log("USB ctecek: " + n);
-                if (n <= 0) { MessageBox.Show(this, "CF601 nenalezena na USB.", "Ctecka", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                if (n <= 0) { _btnConnect.Enabled = true; MessageBox.Show(this, "CF601 nenalezena na USB.", "Ctecka", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
                 try { Log("USB info: " + CF601Reader.UsbInfo(0)); } catch { }
-                _reader = new CF601Reader();
-                _reader.Open(0);
-                var di = _reader.GetDeviceInfo();
-                _lblDevice.Text = string.Format("FW {0}  HW {1}  SN {2}  |  {3}  {4} dBm", SafeS(di.Firmware), SafeS(di.Hardware), SafeS(di.Sn), SafeS(di.RegionName), di.Power);
-                if (di.Workmode != 0) Log("POZN.: WORKMODE=" + di.Workmode + " – pro cteni pameti pouzij WORKMODE=0 (zalozka Konfigurace).");
+                reader = new CF601Reader();
+                Log("Pripojuji a pripravuji ctecku (muze chvili trvat)...");
+                // na pozadi: studeny start + pripadny reconnect muze trvat i nekolik sekund
+                var di = await Task.Run(() => { reader.OpenAndPrepare(0, UiLog); return reader.GetDeviceInfo(); });
+                _reader = reader;
+                _lblDevice.Text = DeviceLabel(di.Firmware, di.Region, di.Power);
                 SetConnected(true);
                 Log("Ctecka pripojena (HID).");
+                if (di.Region >= 0 && !TagDecode.IsEuRegion(di.Region))
+                {
+                    // Region se muze vratit (overeno: RebootDevice vratil USA) – nabidni opravu hned pri pripojeni.
+                    Log("POZOR: ctecka vysila v pasmu " + di.RegionName + ". V EU/CR je povolene jen 865–868 MHz.");
+                    if (!_autoMode && MessageBox.Show(this,
+                            "Ctecka vysila v pasmu:\n" + di.RegionName + "\n\nV EU/CR je pro UHF RFID povolene jen pasmo 865–868 MHz.\n" +
+                            "Prepnout ctecku na EU / ETSI (865,7–867,5 MHz)?",
+                            "Region ctecky", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                    {
+                        var rr = await Task.Run(() => reader.SetRegion(6));
+                        Log(rr.Message);
+                        if (rr.Ok) _lblDevice.Text = DeviceLabel(di.Firmware, 6, di.Power);
+                    }
+                }
             }
-            catch (Exception ex) { _reader?.Dispose(); _reader = null; SetConnected(false); Log("CHYBA: " + ex.Message); MessageBox.Show(this, ex.Message, "Chyba pripojeni", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            catch (Exception ex)
+            {
+                try { reader?.Dispose(); } catch { }
+                _reader = null; SetConnected(false);
+                Log("CHYBA: " + ex.Message);
+                MessageBox.Show(this, ex.Message, "Chyba pripojeni", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally { _busy = false; }
         }
 
         void Disconnect()
         {
+            // Behem operace nesmime zavrit handle – vlakno na pozadi by volalo DLL s neplatnym
+            // handlem (hrozi access violation). Pozadej o zastaveni a nech uzivatele pockat.
+            if (_busy)
+            {
+                _recCancel = true; ScanStop();
+                Log("Probiha operace – zastavuji ji. Odpoj az dobehne.");
+                return;
+            }
             ScanStop();
             try { _reader?.Dispose(); } catch { }
             _reader = null; SetConnected(false); _lblDevice.Text = ""; _lblTag.Text = "Tag: -"; _currentEpc = null;
@@ -700,7 +775,7 @@ namespace UhfTagAnalyzer
 
         async Task RunBusy(string name, Func<Task> work)
         {
-            _busy = true; _tabs.Enabled = true;
+            _busy = true;
             try { await work(); }
             catch (Exception ex) { Log("CHYBA (" + name + "): " + ex.Message); }
             finally { _busy = false; }
@@ -716,10 +791,20 @@ namespace UhfTagAnalyzer
 
         static string SafeS(string s) => string.IsNullOrEmpty(s) ? "?" : s;
 
+        // Kratky popis ctecky do stavoveho radku (HW/SN jsou v zalozce Konfigurace – jinak text pretece).
+        static string DeviceLabel(string fw, int region, int power)
+        {
+            var ri = TagDecode.Region(region);
+            string reg = ri != null ? ri.Name : "region ?";
+            return string.Format("{0}  ·  {1}  ·  {2} dBm", SafeS(fw), reg, power);
+        }
+
         // hex parser: expectLen>0 vynuti presnou delku v bajtech; 0 = libovolna
         static byte[] ParseHex(string s, int expectLen)
         {
             if (s == null) return null;
+            // prefixy 0x odstranit (jinak by "0x" pridalo nulu navic)
+            s = System.Text.RegularExpressions.Regex.Replace(s, "0[xX]", "");
             var clean = new string(s.Where(Uri.IsHexDigit).ToArray());
             if (clean.Length % 2 != 0) return null;
             var b = new byte[clean.Length / 2];
@@ -737,9 +822,69 @@ namespace UhfTagAnalyzer
             else _log.AppendText(line);
         }
 
+        // ============================ SCREENSHOTY DO MANUALU ============================
+        // UhfTagAnalyzer.exe --screenshots <slozka>: pripoji ctecku, projde zalozky se skutecnymi
+        // daty (jen CTENI – nic nezapisuje) a kazdou vyfoti. Bez dialogu (_autoMode).
+        bool _autoMode;
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
+
+        public async Task ScreenshotTour(string dir)
+        {
+            _autoMode = true;
+            Directory.CreateDirectory(dir);
+            Size = new Size(1160, 840);
+            await Connect();
+            if (_reader != null && _reader.IsOpen)
+            {
+                _tabs.SelectedIndex = 0; await Analyze(); await Shot(dir, "01-analyza.png");
+                _tabs.SelectedIndex = 1; ScanStart(); await Task.Delay(3000); ScanStop(); await WaitIdle(); await Shot(dir, "02-sken.png");
+                _tabs.SelectedIndex = 2; await DumpMemory(); await Shot(dir, "03-pamet.png");
+                _tabs.SelectedIndex = 3; _soakDur.Value = 5; await TestSoak(); await TestTemp(); await Shot(dir, "04-testy.png");
+                _tabs.SelectedIndex = 4; await CfgGet(); await Shot(dir, "05-konfigurace.png");
+                _tabs.SelectedIndex = 5; await Shot(dir, "06-operace.png");
+            }
+            else Log("Screenshoty: ctecka neni pripojena.");
+            Close();
+        }
+
+        async Task WaitIdle() { while (_busy) await Task.Delay(100); }
+
+        async Task Shot(string dir, string name)
+        {
+            await Task.Delay(600);           // nech dobehnout BeginInvoke aktualizace UI
+            Invalidate(true); Update(); Application.DoEvents(); await Task.Delay(200);   // dokresli vse (ListView!)
+            using var bmp = new Bitmap(Width, Height);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                IntPtr hdc = g.GetHdc();
+                PrintWindow(Handle, hdc, 2); // PW_RENDERFULLCONTENT
+                g.ReleaseHdc(hdc);
+            }
+            bmp.Save(Path.Combine(dir, name), System.Drawing.Imaging.ImageFormat.Png);
+        }
+
+        bool _closePending;
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             ScanStop();
+            if (_busy)
+            {
+                // nezavirat handle pod bezici operaci – zastav ji a zavri okno az dobehne
+                e.Cancel = true;
+                _recCancel = true;
+                if (!_closePending)
+                {
+                    _closePending = true;
+                    Log("Zaviram po dokonceni probihajici operace...");
+                    var t = new System.Windows.Forms.Timer { Interval = 200 };
+                    t.Tick += (s, a) => { if (!_busy) { t.Stop(); t.Dispose(); Close(); } };
+                    t.Start();
+                }
+                return;
+            }
             try { _reader?.Dispose(); } catch { }
             base.OnFormClosing(e);
         }

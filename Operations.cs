@@ -16,19 +16,18 @@ namespace UhfTagAnalyzer
 
     public class ReaderConfig
     {
-        public int Region, Power, QValue, Session, Workmode, Antenna, RfidType;
-        public int FreqStart, FreqStop, FreqStep; // kHz-ish dle FreqInfo
+        public int Region, Power, QValue, Session, Workmode, Antenna, RfidType, Port;
+        public double FreqStartMHz, FreqEndMHz;   // frekvencni plan z DevicePara
+        public int FreqStepKHz, FreqChannels;
         public int TempCur, TempLimit;
         public string Firmware, Hardware, Sn;
         public DevicePara Raw;
     }
 
-    public class ChannelStat { public int Channel; public int Count; public double AvgRssi; }
-
     public class SoakStat
     {
         public int TotalReads, UniqueTags, Polls;
-        public double Seconds, ReadsPerSec, RssiMin, RssiMax, RssiAvg, RssiStd;
+        public double Seconds, ReadsPerSec, RssiMin, RssiMax, RssiAvg, RssiStd, SuccessPct;
         public string Grade;
     }
 
@@ -36,36 +35,73 @@ namespace UhfTagAnalyzer
     {
         // ---------------- ZAPIS / OPERACE ----------------
 
-        public OpResult WriteMemory(Bank bank, ushort wordPtr, byte[] data, byte[] accPwd = null)
+        const ushort CMD_WRITE = 0x0004, CMD_LOCK = 0x0005, CMD_KILL = 0x0006;
+
+        // Navratovka WriteTag/LockTag/KillTag znamena jen "prikaz prijat". Skutecny vysledek
+        // poslou tagy pres GetTagResp: 0 = uspech, zaporny kod = tag odmitl (heslo, zamek...),
+        // nakonec ukoncovaci -249. Frontu docti az do konce, jinak rozhodi dalsi operace.
+        OpResult CollectTagResp(ushort cmd, int sendRes, byte[] expectEpc, string okMsg)
+        {
+            if (sendRes != 0)
+                return new OpResult { Ok = false, Status = sendRes, Message = ErrorCodes.Text(sendRes) };
+            int status = -249; bool ok = false, terminated = false;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 3000)
+            {
+                int r = NativeApi.GetTagResp(_h, cmd, out var resp, 1000);
+                if (r == -249) { terminated = true; break; }     // konec operace
+                if (r == -238) break;                             // nic dalsiho neprislo
+                if (r == -248 || r == -241) continue;             // prechodne
+                int cl = Math.Min((int)resp.codeLen, resp.code?.Length ?? 0);
+                var epc = resp.code?.Take(cl).ToArray() ?? Array.Empty<byte>();
+                if (expectEpc != null && epc.Length > 0 && !TagDecode.SameBytes(epc, expectEpc)) continue;
+                if (r == 0) { ok = true; status = 0; }
+                else if (!ok) status = r;
+            }
+            if (!terminated) { try { NativeApi.InventoryStop(_h, 1000); } catch { } }
+            return new OpResult { Ok = ok, Status = status, Message = ok ? okMsg : ErrorCodes.Text(status) };
+        }
+
+        public OpResult WriteMemory(Bank bank, ushort wordPtr, byte[] data, byte[] accPwd = null, byte[] expectEpc = null)
         {
             accPwd ??= new byte[4];
             if (data == null || data.Length == 0 || data.Length % 2 != 0)
                 return new OpResult { Ok = false, Message = "Data musi byt po celych slovech (2 B)." };
             byte words = (byte)(data.Length / 2);
             int res = NativeApi.WriteTag(_h, 0, accPwd, (byte)bank, wordPtr, words, data);
-            return new OpResult { Ok = res == 0, Status = res, Message = res == 0 ? "Zapis OK" : ErrorCodes.Text(res) };
+            return CollectTagResp(CMD_WRITE, res, expectEpc, "Zapis OK");
         }
 
-        // Zapis noveho EPC (prepocita PC slovo z delky). newEpc = cele EPC v bajtech (nasobek 2).
-        public OpResult WriteEpc(byte[] newEpc, byte[] accPwd = null)
+        // Zapis noveho EPC. newEpc = cele EPC v bajtech (nasobek 2).
+        // PC slovo: zmeni se JEN delka (horni 5 bitu); UMI/XI/T/AFI-NSI se zachovaji z aktualniho PC.
+        // currentEpc = EPC tagu, na ktery se zapisuje (pro kontrolu odpovedi; select nastavi volajici).
+        public OpResult WriteEpc(byte[] newEpc, byte[] accPwd = null, byte[] currentEpc = null)
         {
             if (newEpc == null || newEpc.Length == 0 || newEpc.Length % 2 != 0)
                 return new OpResult { Ok = false, Message = "EPC musi byt v celych slovech (2 B)." };
             int words = newEpc.Length / 2;
             if (words > 31) return new OpResult { Ok = false, Message = "EPC je prilis dlouhe (max 31 slov)." };
-            int pc = (words << 11) & 0xF800; // horni 5 bitu = delka v slovech
+
+            var cur = ReadMemory(Bank.Epc, 1, 1, accPwd, 2, currentEpc);     // aktualni PC
+            if (!cur.Ok || cur.Data.Length < 2)
+                return new OpResult { Ok = false, Status = cur.Status, Message = "Nelze precist aktualni PC slovo (" + cur.StatusText + ") – zapis zrusen." };
+            int oldPc = (cur.Data[0] << 8) | cur.Data[1];
+            int pc = ((words & 0x1F) << 11) | (oldPc & 0x07FF);
+
             var buf = new byte[2 + newEpc.Length];
             buf[0] = (byte)(pc >> 8); buf[1] = (byte)(pc & 0xFF);
             Array.Copy(newEpc, 0, buf, 2, newEpc.Length);
             // zapis od slova 1 (PC), nasleduje EPC
-            return WriteMemory(Bank.Epc, 1, buf, accPwd);
+            var w = WriteMemory(Bank.Epc, 1, buf, accPwd, currentEpc);
+            if (w.Ok) w.Message = string.Format("Zapis EPC OK (PC {0:X4} -> {1:X4})", oldPc, pc);
+            return w;
         }
 
         public OpResult LockBank(LockArea area, LockAction action, byte[] accPwd = null)
         {
             accPwd ??= new byte[4];
             int res = NativeApi.LockTag(_h, accPwd, (byte)area, (byte)action);
-            return new OpResult { Ok = res == 0, Status = res, Message = res == 0 ? "Lock OK" : ErrorCodes.Text(res) };
+            return CollectTagResp(CMD_LOCK, res, null, "Lock OK");
         }
 
         // Nastaveni hesla: which=kill -> RESERVED word 0..1; which=access -> word 2..3
@@ -85,70 +121,80 @@ namespace UhfTagAnalyzer
                 return new OpResult { Ok = false, Message = "Kill s nulovym heslem neni povolen (tag se nezabije)." };
             if (selectEpc != null) SelectByEpc(selectEpc);
             int res = NativeApi.KillTag(_h, killPwd);
-            return new OpResult { Ok = res == 0, Status = res, Message = res == 0 ? "Tag zabit (kill OK)" : ErrorCodes.Text(res) };
+            return CollectTagResp(CMD_KILL, res, null, "Tag zabit (kill OK)");
         }
 
         // ---------------- OBNOVA HESLA (vlastni tagy) ----------------
-        // Oracle: zkusi zapsat zpet STEJNA data do EPC banky. Funguje jen kdyz je
-        // EPC banka zamcena (jinak projde i spatne heslo). Vraci nalezene heslo nebo null.
-
-        public bool IsEpcBankLocked(out byte[] currentPcEpc)
-        {
-            currentPcEpc = null;
-            var r = ReadMemory(Bank.Epc, 1, 7); // PC + az 6 slov EPC
-            if (!r.Ok || r.Data.Length < 2) return false;
-            // delka EPC z PC
-            int pc = (r.Data[0] << 8) | r.Data[1];
-            int words = (pc >> 11) & 0x1F;
-            int need = 2 + words * 2;
-            if (r.Data.Length < need) { currentPcEpc = r.Data; }
-            else currentPcEpc = r.Data.Take(need).ToArray();
-            // zkus zapis se spatnym (nulovym) heslem; pokud selze na zamku -> je zamceno
-            var probe = WriteMemory(Bank.Epc, 1, currentPcEpc, new byte[] { 0, 0, 0, 0 });
-            if (probe.Ok) return false; // zapis prosel -> neni zamceno
-            // zamceno / chyba hesla
-            return probe.Status == -189 || probe.Status == -172 || probe.Status == -188
-                || probe.Status == -187 || probe.Status == -191 || probe.Status == -174;
-        }
+        // NEDESTRUKTIVNI orakulum CTENIM (overeno na CF601 + Impinj M750):
+        //   pri nenulovem hesle ctecka pred ctenim posle Gen2 Access. Spatne heslo -> cteni
+        //   TID selze (-247); spravne heslo -> cteni projde. Do tagu se NIC nezapisuje.
+        // Funguje na kazdem tagu s nastavenym (nenulovym) access heslem. Nalezene heslo se
+        // potvrdi prectenim RESERVED banky, ktera po odemceni ukaze kill + access heslo.
 
         public byte[] RecoverAccessPassword(IEnumerable<byte[]> candidates, byte[] selectEpc,
                                             Action<string> progress, Func<bool> cancel = null, long total = 0)
         {
+            void P(string s) => progress?.Invoke(s);
             if (selectEpc != null) SelectByEpc(selectEpc);
-            if (!IsEpcBankLocked(out var pcEpc) || pcEpc == null)
+            try
             {
-                progress?.Invoke("EPC banka neni zamcena – oracle nefunguje, obnovu nelze provest.");
+                // 1) tag musi odpovidat bez hesla (jinak by kazdy pokus vypadal jako "spatne heslo")
+                var ctl = ReadMemory(Bank.Tid, 0, 2, null, 2, selectEpc);
+                if (!ctl.Ok) { P("Tag neodpovida (kontrolni cteni TID: " + ctl.StatusText + "). Priloz tag a zkus znovu."); return null; }
+
+                // 2) neni RESERVED citelna rovnou? pak heslo vycteme primo
+                var direct = ReadMemory(Bank.Reserved, 2, 2, null, 1, selectEpc);
+                if (direct.Ok && direct.Data.Length >= 4)
+                {
+                    bool zero = direct.Data.All(b => b == 0);
+                    P("RESERVED je citelna bez hesla – access heslo = " + TagDecode.Hex(direct.Data, false) +
+                      (zero ? " (NENASTAVENO, tag zadne heslo nema)" : " (vycteno primo)"));
+                    return zero ? null : direct.Data.Take(4).ToArray();
+                }
+
+                long tried = 0; int ctlFails = 0;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                foreach (var cand in candidates)
+                {
+                    if (cancel != null && cancel()) { P(string.Format("Preruseno po {0} pokusech.", tried)); return null; }
+                    if (cand == null || cand.Length != 4 || cand.All(b => b == 0)) continue; // 0 = bez Access, nic neoveri
+                    tried++;
+
+                    var t = ReadMemory(Bank.Tid, 0, 2, cand, 0, selectEpc);
+                    if (t.Ok)
+                    {
+                        // potvrzeni: s timto heslem musi jit precist RESERVED (kill + access)
+                        var conf = ReadMemory(Bank.Reserved, 0, 4, cand, 2, selectEpc);
+                        if (conf.Ok && conf.Data.Length >= 8)
+                            P(string.Format("NALEZENO po {0} pokusech: {1}   (RESERVED: kill {2}, access {3})", tried,
+                                TagDecode.Hex(cand, false), TagDecode.Hex(conf.Data.Take(4).ToArray(), false),
+                                TagDecode.Hex(conf.Data.Skip(4).Take(4).ToArray(), false)));
+                        else
+                            P(string.Format("NALEZENO po {0} pokusech: {1}   (cteni s heslem proslo; RESERVED: {2})",
+                                tried, TagDecode.Hex(cand, false), conf.StatusText));
+                        return cand;
+                    }
+
+                    // prubezna kontrola, ze tag porad lezi na ctecce
+                    if (tried % 50 == 0)
+                    {
+                        if (!ReadMemory(Bank.Tid, 0, 2, null, 2, selectEpc).Ok)
+                        {
+                            if (++ctlFails >= 2) { P("Tag prestal odpovidat (posunut / odebran?) – obnova prerusena po " + tried + " pokusech."); return null; }
+                        }
+                        else ctlFails = 0;
+                    }
+                    if (tried % 100 == 0)
+                    {
+                        double rate = tried / Math.Max(sw.Elapsed.TotalSeconds, 0.001);
+                        string eta = total > 0 && rate > 0 ? "  zbyva ~" + FmtDur((total - tried) / rate) : "";
+                        P(string.Format("{0}{1} pokusu   {2:0.0} /s{3}", tried, total > 0 ? "/" + total : "", rate, eta));
+                    }
+                }
+                P(string.Format("Heslo nenalezeno ({0} kandidatu).", tried));
                 return null;
             }
-            long tried = 0;
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            foreach (var cand in candidates)
-            {
-                if (cancel != null && cancel()) { progress?.Invoke(string.Format("Preruseno po {0} pokusech.", tried)); return null; }
-                if (cand == null || cand.Length != 4) continue;
-                tried++;
-                if (selectEpc != null) SelectByEpc(selectEpc);
-                var w = WriteMemory(Bank.Epc, 1, pcEpc, cand);
-                if (w.Ok)
-                {
-                    progress?.Invoke(string.Format("NALEZENO po {0} pokusech: {1}", tried, TagDecode.Hex(cand, false)));
-                    return cand;
-                }
-                if (tried % 100 == 0)
-                {
-                    double rate = tried / Math.Max(sw.Elapsed.TotalSeconds, 0.001);
-                    string eta = "";
-                    if (total > 0 && rate > 0)
-                    {
-                        double sec = (total - tried) / rate;
-                        eta = "  zbyva ~" + FmtDur(sec);
-                    }
-                    progress?.Invoke(string.Format("{0}{1} pokusu   {2:0} /s{3}",
-                        tried, total > 0 ? "/" + total : "", rate, eta));
-                }
-            }
-            progress?.Invoke(string.Format("Heslo nenalezeno ({0} kandidatu).", tried));
-            return null;
+            finally { ClearSelect(); }
         }
 
         static string FmtDur(double s)
@@ -211,7 +257,9 @@ namespace UhfTagAnalyzer
             if (string.IsNullOrEmpty(text)) return list;
             foreach (var tok in text.Split(new[] { '\r', '\n', ',', ';', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries))
             {
-                var h = new string(tok.Where(Uri.IsHexDigit).ToArray());
+                // "0x12345678" – prefix 0x jinak prida nulu navic (9 znaku) a heslo by se zahodilo
+                var t = tok.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? tok.Substring(2) : tok;
+                var h = new string(t.Where(Uri.IsHexDigit).ToArray());
                 if (h.Length != 8) continue;
                 list.Add(new[] {
                     Convert.ToByte(h.Substring(0,2),16), Convert.ToByte(h.Substring(2,2),16),
@@ -248,54 +296,66 @@ namespace UhfTagAnalyzer
 
         // ---------------- TESTY ----------------
 
-        // Test citlivosti: ramp vykonu, pro kazdy vykon kratka inventura cile.
+        // Test citlivosti: ramp vykonu SHORA DOLU, pro kazdy vykon kratka inventura cile.
+        // Konci po 2 neuspesnych krocich za sebou: krok bez cteni trva na CF601 ~11-17 s
+        // (InventoryContinue bez tagu v dosahu vraci timeouty), krok se ctenim ~1 s.
+        // Vysledek (minimalni vykon) je stejny jako u plneho rampu, jen rychleji.
         public List<(int power, double readRate, double rssi)> SensitivityTest(
             byte[] targetEpc, int minPow, int maxPow, double perStep, Action<string> progress, Func<bool> cancel = null)
         {
             var res = new List<(int, double, double)>();
-            byte origPow = 17; { if (NativeApi.GetRFPower(_h, out var p, out _) == 0) origPow = p; }
+            // Puvodni vykon z DevicePara.RFIDPOWER (overeno). NE z GetRFPower – ta na CF601 vratila 1,
+            // takze se vykon po testu "obnovil" na 1 dBm a ctecka pak tag nevidela.
+            if (GetParaRetry(out var p0, 10) != 0)
+            {
+                progress?.Invoke("Nelze zjistit aktualni vykon – test zrusen (vykon by se pak nedal vratit).");
+                return res;
+            }
+            byte origPow = p0.RFIDPOWER;
             try
             {
-                for (int pow = minPow; pow <= maxPow; pow++)
+                int failsInRow = 0;
+                for (int pow = maxPow; pow >= minPow; pow--)
                 {
                     if (cancel != null && cancel()) break;
-                    NativeApi.SetRFPower(_h, (byte)pow, 0);
-                    Thread.Sleep(40);
-                    var found = Inventory(perStep, out int polls);
+                    if (failsInRow >= 2)
+                    {
+                        progress?.Invoke(string.Format("   (pod {0} dBm uz nemereno – 2 kroky za sebou bez cteni)", pow + 1));
+                        break;
+                    }
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    int sp = NativeApi.SetRFPower(_h, (byte)pow, 0);
+                    // Po SetRFPower je ctecka chvili zaneprazdnena (prikazy vraci -238).
+                    // Pockej, az zase odpovida – jinak by inventura falesne hlasila 0 %.
+                    bool ready = GetParaRetry(out _, 20) == 0;
+                    var found = Inventory(perStep, out int polls, 6);
                     TagRecord t = targetEpc != null
                         ? found.Values.FirstOrDefault(x => TagDecode.SameBytes(x.Epc, targetEpc))
-                        : found.Values.OrderByDescending(x => x.Rssi).FirstOrDefault();
+                        : found.Values.OrderByDescending(x => x.RssiAvg).FirstOrDefault();
                     double rate = t != null ? 100.0 * t.Count / Math.Max(polls, 1) : 0;
-                    double rssi = t?.Rssi ?? 0;
+                    double rssi = t?.RssiAvg ?? 0;
                     res.Add((pow, rate, rssi));
-                    progress?.Invoke(string.Format("{0,2} dBm: cteni {1,3:0} %  RSSI {2}", pow, rate, t != null ? rssi.ToString("0.0") : "-"));
+                    failsInRow = rate > 0 ? 0 : failsInRow + 1;
+                    progress?.Invoke(string.Format("{0,2} dBm: cteni {1,3:0} %  RSSI {2}{3}   ({4} ms)", pow, rate,
+                        t != null ? rssi.ToString("0.0") : "-",
+                        sp != 0 ? "  [SetRFPower " + sp + "]" : !ready ? "  [ctecka neodpovidala]" : "",
+                        sw.ElapsedMilliseconds));
                 }
             }
-            finally { NativeApi.SetRFPower(_h, origPow, 0); }
-            return res;
-        }
-
-        // Kanalovy sken: delsi inventura, agregace po kanalech (frekvencni odezva)
-        public List<ChannelStat> ChannelScan(double seconds, Action<string> progress)
-        {
-            var map = new Dictionary<int, (int cnt, double sum)>();
-            NativeApi.InventoryContinue(_h, 0, 0);
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            try
+            finally
             {
-                while (sw.Elapsed.TotalSeconds < seconds)
+                // vratit puvodni vykon a OVERIT zpetnym ctenim (az 3 pokusy)
+                bool restored = false;
+                for (int i = 0; i < 3 && !restored; i++)
                 {
-                    if (NativeApi.GetTagUii(_h, out var tag, 200) != 0) continue;
-                    if (tag.codeLen == 0) continue;
-                    int ch = tag.channel;
-                    var cur = map.TryGetValue(ch, out var e) ? e : (0, 0.0);
-                    map[ch] = (cur.Item1 + 1, cur.Item2 + tag.rssi / 10.0);
+                    NativeApi.SetRFPower(_h, origPow, 0);
+                    restored = GetParaRetry(out var p1, 20) == 0 && p1.RFIDPOWER == origPow;
                 }
+                progress?.Invoke(restored
+                    ? "Vykon vracen na " + origPow + " dBm."
+                    : "!! Vykon se NEPODARILO vratit na " + origPow + " dBm – nastav ho v zalozce Konfigurace.");
             }
-            finally { NativeApi.InventoryStop(_h, 1000); }
-            return map.OrderBy(k => k.Key)
-                      .Select(k => new ChannelStat { Channel = k.Key, Count = k.Value.cnt, AvgRssi = k.Value.sum / k.Value.cnt })
-                      .ToList();
+            return res;
         }
 
         // Soak test stability
@@ -303,25 +363,25 @@ namespace UhfTagAnalyzer
         {
             var rssis = new List<double>();
             var uniq = new HashSet<string>();
-            int reads = 0, polls = 0;
-            NativeApi.InventoryContinue(_h, 0, 0);
+            int reads = 0;
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            try
+            // Soak bezi celou dobu: kdyz inventura skonci (-249 = tag chvili nebyl videt), spust ji znovu.
+            int polls = 0;
+            while (sw.Elapsed.TotalSeconds < seconds && !(cancel != null && cancel()))
             {
-                while (sw.Elapsed.TotalSeconds < seconds)
+                double left = seconds - sw.Elapsed.TotalSeconds;
+                bool started = InventoryLoop(left, 0, tag =>
                 {
-                    if (cancel != null && cancel()) break;
-                    int r = NativeApi.GetTagUii(_h, out var tag, 200);
-                    polls++;
-                    if (r != 0 || tag.codeLen == 0) continue;
                     reads++;
                     rssis.Add(tag.rssi / 10.0);
-                    var epc = new byte[tag.codeLen]; Array.Copy(tag.code, epc, tag.codeLen);
+                    int n = Math.Min((int)tag.codeLen, tag.code.Length);
+                    var epc = new byte[n]; Array.Copy(tag.code, epc, n);
                     uniq.Add(TagDecode.Hex(epc, false));
                     if (reads % 100 == 0) progress?.Invoke(reads + " cteni...");
-                }
+                }, cancel, out int p);
+                polls += p;
+                if (!started) { progress?.Invoke("Inventuru se nepodarilo spustit (ctecka neodpovida)."); break; }
             }
-            finally { NativeApi.InventoryStop(_h, 1000); }
             double secs = sw.Elapsed.TotalSeconds;
             var st = new SoakStat
             {
@@ -334,8 +394,11 @@ namespace UhfTagAnalyzer
                 double avg = st.RssiAvg;
                 st.RssiStd = Math.Sqrt(rssis.Sum(x => (x - avg) * (x - avg)) / rssis.Count);
             }
-            st.Grade = st.ReadsPerSec > 150 ? "A (vyborne)" : st.ReadsPerSec > 80 ? "B (dobre)"
-                     : st.ReadsPerSec > 30 ? "C (prumerne)" : st.ReadsPerSec > 5 ? "D (slabe)" : "F (nefunkcni)";
+            // Znamka podle PODILU uspesnych odezev, ne podle absolutni rychlosti: CF601 zvladne
+            // jen ~22 cteni/s i pri dokonalem signalu (puvodni hranice A >150/s byly nedosazitelne).
+            st.SuccessPct = 100.0 * reads / Math.Max(st.Polls, 1);
+            st.Grade = st.SuccessPct >= 95 ? "A (vyborne)" : st.SuccessPct >= 80 ? "B (dobre)"
+                     : st.SuccessPct >= 50 ? "C (prumerne)" : st.SuccessPct >= 20 ? "D (slabe)" : "F (nefunkcni)";
             return st;
         }
 
@@ -347,48 +410,64 @@ namespace UhfTagAnalyzer
             if (NativeApi.GetDevicePara(_h, out var p) == 0)
             {
                 c.Raw = p; c.Region = p.REGION; c.Power = p.RFIDPOWER; c.QValue = p.QVALUE;
-                c.Session = p.SESSION; c.Workmode = p.WORKMODE; c.Antenna = p.ANT;
-                c.FreqStart = (p.STRATFREI[0] << 8) | p.STRATFREI[1];
-                c.FreqStep = (p.STEPFRE[0] << 8) | p.STEPFRE[1];
+                c.Session = p.SESSION; c.Workmode = p.WORKMODE; c.Antenna = p.ANT; c.Port = p.INTERFACE;
+                // big-endian: STRATFREI = cele MHz, STRATFRED = desetinna cast v kHz, STEPFRE = krok v kHz
+                int mhz = (p.STRATFREI[0] << 8) | p.STRATFREI[1];
+                int khz = (p.STRATFRED[0] << 8) | p.STRATFRED[1];
+                c.FreqStepKHz = (p.STEPFRE[0] << 8) | p.STEPFRE[1];
+                c.FreqChannels = p.CN;
+                c.FreqStartMHz = mhz + khz / 1000.0;
+                c.FreqEndMHz = c.FreqStartMHz + Math.Max(0, p.CN - 1) * c.FreqStepKHz / 1000.0;
             }
             if (NativeApi.GetRFIDType(_h, out var t) == 0) c.RfidType = t;
             if (NativeApi.GetTemperature(_h, out var cur, out var lim) == 0) { c.TempCur = cur; c.TempLimit = lim; }
-            if (NativeApi.GetDeviceInfo(_h, out var di) == 0)
-            {
-                c.Firmware = AsciiZ(di.firmVersion); c.Hardware = AsciiZ(di.hardVersion);
-                c.Sn = TagDecode.Hex(di.SN, false);
-            }
+            var info = GetDeviceInfo();   // sjednoceno: FW/HW/SN cele ctecky (viz Reader.GetDeviceInfo)
+            c.Firmware = info.Firmware; c.Hardware = info.Hardware; c.Sn = info.Sn;
             return c;
         }
 
-        static string AsciiZ(byte[] b)
-        {
-            int n = Array.IndexOf(b, (byte)0); if (n < 0) n = b.Length;
-            return System.Text.Encoding.ASCII.GetString(b, 0, n).Trim();
-        }
-
-        public OpResult SetPower(int dbm)
-        {
-            int res = NativeApi.SetRFPower(_h, (byte)dbm, 0);
-            return new OpResult { Ok = res == 0, Status = res, Message = res == 0 ? "Vykon nastaven" : ErrorCodes.Text(res) };
-        }
-
-        // Nastaveni zakladnich parametru (region/vykon/Q/session/workmode) pres DevicePara
-        public OpResult SetBasicConfig(int region, int power, int qvalue, int session, int workmode)
+        // Nastaveni zakladnich parametru (vykon/Q/session/workmode) pres DevicePara.
+        // Region se tu NEMENI – na to je SetRegion (musi nastavit i frekvencni tabulku).
+        public OpResult SetBasicConfig(int power, int qvalue, int session, int workmode)
         {
             if (NativeApi.GetDevicePara(_h, out var p) != 0)
                 return new OpResult { Ok = false, Message = "Nelze nacist aktualni parametry." };
-            p.REGION = (byte)region; p.RFIDPOWER = (byte)power; p.QVALUE = (byte)qvalue;
+            p.RFIDPOWER = (byte)power; p.QVALUE = (byte)qvalue;
             p.SESSION = (byte)session; p.WORKMODE = (byte)workmode;
             int res = NativeApi.SetDevicePara(_h, p);
             return new OpResult { Ok = res == 0, Status = res, Message = res == 0 ? "Konfigurace ulozena" : ErrorCodes.Text(res) };
         }
 
-        public OpResult Reboot()
+        // Prepne radiovy region VCETNE frekvencni tabulky (stejne jako vyrobcova aplikace):
+        // REGION + STRATFREI (cele MHz) + STRATFRED (kHz) + STEPFRE (kHz) + CN (pocet kanalu).
+        public OpResult SetRegion(int code)
         {
-            int res = NativeApi.RebootDevice(_h);
-            return new OpResult { Ok = res == 0, Status = res, Message = res == 0 ? "Prikaz reboot odeslan" : ErrorCodes.Text(res) };
+            var ri = TagDecode.Region(code);
+            if (ri == null) return new OpResult { Ok = false, Message = "Neznamy region " + code + "." };
+            if (NativeApi.GetDevicePara(_h, out var p) != 0)
+                return new OpResult { Ok = false, Message = "Nelze nacist aktualni parametry." };
+            int mhz = (int)Math.Floor(ri.StartMHz + 1e-9);
+            int khz = (int)Math.Round((ri.StartMHz - mhz) * 1000);
+            p.REGION = (byte)code;
+            p.STRATFREI = new[] { (byte)(mhz >> 8), (byte)mhz };
+            p.STRATFRED = new[] { (byte)(khz >> 8), (byte)khz };
+            p.STEPFRE = new[] { (byte)(ri.StepKHz >> 8), (byte)ri.StepKHz };
+            p.CN = (byte)ri.Channels;
+            int res = NativeApi.SetDevicePara(_h, p);
+            if (res != 0) return new OpResult { Ok = false, Status = res, Message = "SetDevicePara: " + ErrorCodes.Text(res) };
+            Thread.Sleep(150);
+            var c = GetFullConfig();
+            bool ok = c.Region == code && Math.Abs(c.FreqStartMHz - ri.StartMHz) < 0.0005
+                      && c.FreqStepKHz == ri.StepKHz && c.FreqChannels == ri.Channels;
+            return new OpResult
+            {
+                Ok = ok, Status = res,
+                Message = ok ? "Region nastaven: " + ri
+                             : string.Format("Region zapsan, ale overeni nesedi (ctecka hlasi region {0}, {1:0.000} MHz, krok {2} kHz, {3} kan.)",
+                                             c.Region, c.FreqStartMHz, c.FreqStepKHz, c.FreqChannels)
+            };
         }
+
 
         // ---------------- DUMP PAMETI ----------------
         public class BankDump { public Bank Bank; public byte[] Data; public bool Ok; public string Note; }
@@ -398,27 +477,19 @@ namespace UhfTagAnalyzer
             accPwd ??= new byte[4];
             if (selectEpc != null) SelectByEpc(selectEpc);
             var res = new List<BankDump>();
-            // RESERVED: 4 slova; EPC: dle PC; TID: 6; USER: cteni po blocich
-            res.Add(DumpBank(Bank.Reserved, 4, accPwd));
-            res.Add(DumpBank(Bank.Epc, 8, accPwd));
-            res.Add(DumpBank(Bank.Tid, 6, accPwd));
-            // USER postupne
-            var user = new List<byte>(); int ptr = 0; string note = null; bool ok = false;
-            while (ptr < 128)
+            try
             {
-                var r = ReadMemory(Bank.User, (ushort)ptr, 8, accPwd);
-                if (!r.Ok) { if (ptr == 0) note = r.StatusText; break; }
-                ok = true; user.AddRange(r.Data); ptr += 8;
-                if (r.Data.Length < 16) break;
+                // RESERVED: 4 slova (kill + access); ostatni banky az do konce (velikost se zjisti cteni)
+                res.Add(DumpBank(ReadMemory(Bank.Reserved, 0, 4, accPwd, expectEpc: selectEpc), Bank.Reserved));
+                res.Add(DumpBank(ReadBankAll(Bank.Epc, 34, accPwd, selectEpc), Bank.Epc));     // CRC+PC+az 31 slov EPC (+XPC)
+                res.Add(DumpBank(ReadBankAll(Bank.Tid, 32, accPwd, selectEpc), Bank.Tid));
+                res.Add(DumpBank(ReadBankAll(Bank.User, 128, accPwd, selectEpc), Bank.User));
             }
-            res.Add(new BankDump { Bank = Bank.User, Data = user.ToArray(), Ok = ok, Note = note });
+            finally { ClearSelect(); }
             return res;
         }
 
-        BankDump DumpBank(Bank b, byte words, byte[] accPwd)
-        {
-            var r = ReadMemory(b, 0, words, accPwd);
-            return new BankDump { Bank = b, Data = r.Data, Ok = r.Ok, Note = r.Ok ? null : r.StatusText };
-        }
+        static BankDump DumpBank(BankRead r, Bank b) =>
+            new BankDump { Bank = b, Data = r.Data, Ok = r.Ok && r.Data.Length > 0, Note = r.Ok ? null : r.StatusText };
     }
 }
